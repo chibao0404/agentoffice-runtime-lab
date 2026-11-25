@@ -1,18 +1,17 @@
-name: M5-P2-A Remote Lab
+name: M5-P2-A Remote Lab Diagnostic
 on:
   workflow_dispatch:
     inputs:
       phase:
         type: choice
-        options: [prepare, verify, probe]
+        options: [diagnostic]
         required: true
-permissions:
-  contents: read
+permissions: {}
 concurrency:
   group: m5-p2-a-remote-lab
   cancel-in-progress: false
 jobs:
-  lab:
+  diagnostic:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     defaults:
@@ -21,113 +20,83 @@ jobs:
     env:
       PHASE: ${{ inputs.phase }}
       APPROVED_REPO: ${{ vars.P2A_REPO }}
-      PREPARE_COMMIT: ${{ vars.P2A_PREPARE_COMMIT }}
-      VERIFY_COMMIT: ${{ vars.P2A_VERIFY_COMMIT }}
-      PROBE_COMMIT: ${{ vars.P2A_PROBE_COMMIT }}
-      ELF_SHA: ${{ vars.P2A_ELF_SHA256 }}
-      ELF_BYTES: ${{ vars.P2A_ELF_BYTES }}
-      ARCHIVE_SHA: 3911007fc94091b5eea2a10512b2b4fc52b673bc0cb3026e4cbff0cd518dd060
+      DIAGNOSTIC_COMMIT: ${{ vars.P2A_DIAGNOSTIC_COMMIT }}
       SCHEMA_SHA: 021462a9bacd117f4cd40c256a4888619d059cec6a65b795198d521ba660e554
       BASE: docker.io/library/node@sha256:d45d78e7929b46875bbd4e29bea672d5bc48186c6c3588306521c815e78352d6
     steps:
-      - name: Enforce authorization pins
+      - name: Enforce diagnostic authorization
         run: |
           trap 'echo BLOCKED_AUTHORIZATION' ERR
+          [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9-]+/agentoffice-runtime-lab$ ]]
           test "$GITHUB_REPOSITORY" = "$APPROVED_REPO"
           test "$GITHUB_REF" = refs/heads/main
           test "$GITHUB_RUN_ATTEMPT" = 1
           test "$GITHUB_ACTOR" = "$GITHUB_REPOSITORY_OWNER"
           test "$GITHUB_TRIGGERING_ACTOR" = "$GITHUB_REPOSITORY_OWNER"
           test "$RUNNER_OS/$RUNNER_ARCH" = Linux/X64
-          case "$PHASE" in
-            prepare) test "$GITHUB_SHA" = "$PREPARE_COMMIT" ;;
-            verify) test "$GITHUB_SHA" = "$VERIFY_COMMIT" ;;
-            probe)
-              test "$GITHUB_SHA" = "$PROBE_COMMIT"
-              [[ "$ELF_SHA" =~ ^[a-f0-9]{64}$ ]]
-              [[ "$ELF_BYTES" =~ ^[1-9][0-9]{0,8}$ ]]
-              (( ELF_BYTES < 805306368 )) ;;
-            *) exit 1 ;;
-          esac
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-          fetch-depth: 1
-          submodules: false
-          lfs: false
-      - name: Stage and verify official inputs on networked host
+          test "$PHASE" = diagnostic
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_SHA" = "$DIAGNOSTIC_COMMIT"
+          echo DIAGNOSTIC_PIN_ACCEPTED
+      - name: Verify sources, run synthetic diagnostics and attest cleanup
         run: |
-          trap 'echo BLOCKED_STAGING' ERR
           umask 077
-          for utility in curl zstd sha256sum python3 timeout git docker readelf; do
-            command -v "$utility" >/dev/null
-          done
-          printf '%s\n' .github/workflows/m5-p2-a.yml contract.json probe.mjs |
-            diff -q - <(git ls-tree -r --name-only HEAD) >/dev/null
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(df -Pk "$RUNNER_TEMP" | awk 'END {print $4}')" -ge 4194304
-          lab=$(mktemp -d "$RUNNER_TEMP/m5-p2-a.XXXXXX")
-          printf 'LAB=%s\n' "$lab" >> "$GITHUB_ENV"
-          mkdir "$lab/context"
-          fetch() {
-            curl --proto '=https' --proto-redir '=https' --fail --silent --show-error \
-              --location --max-time 80 --max-filesize "$2" --output "$3" "$1" 2>/dev/null
-            test "$(wc -c < "$3")" -eq "$2"
+          exec 2>/dev/null
+          trap 'echo BLOCKED_DIAGNOSTIC_HOST_STEP' ERR
+          LAB=$(mktemp -d "$RUNNER_TEMP/m5-p2-a.XXXXXX" 2>/dev/null)
+          cleanup() {
+            rc=$?
+            trap - EXIT ERR
+            parent=$(realpath -e "$RUNNER_TEMP" 2>/dev/null) || parent=
+            if [[ -n "$parent" && "$LAB" =~ /m5-p2-a\.[a-zA-Z0-9]{6}$ &&
+                  -d "$LAB" && ! -L "$LAB" && "$(realpath -e "$LAB" 2>/dev/null)" == "$parent/"* ]] &&
+                rm -rf -- "$LAB" >/dev/null 2>&1 && [[ ! -e "$LAB" && ! -L "$LAB" ]]; then
+              echo TEMP_CLEANUP_COMPLETE
+              exit "$rc"
+            fi
+            echo TEMP_CLEANUP_FAILURE
+            exit 1
           }
-          fetch 'https://raw.githubusercontent.com/openai/codex/rust-v0.167.0/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json' \
-            753162 "$lab/context/schema.json"
-          printf '%s  %s\n' "$SCHEMA_SHA" "$lab/context/schema.json" | sha256sum --check --status
-          if [[ "$PHASE" == verify ]]; then
-            printf 'Synthetic phase verified schema SHA256 %s\n' "$SCHEMA_SHA"
-            exit 0
-          fi
-          fetch 'https://github.com/openai/codex/releases/download/rust-v0.167.0/codex-x86_64-unknown-linux-musl.zst' \
-            87330415 "$lab/codex.zst"
-          printf '%s  %s\n' "$ARCHIVE_SHA" "$lab/codex.zst" | sha256sum --check --status
-          (ulimit -f 786432; timeout 20s zstd -q -d -c "$lab/codex.zst" > "$lab/context/codex")
-          read -r actual_sha _ < <(sha256sum "$lab/context/codex")
-          actual_bytes=$(wc -c < "$lab/context/codex")
-          python3 - "$lab/context/codex" <<'PY'
-          import sys
-          with open(sys.argv[1], 'rb') as f:
-              h = f.read(20)
-          assert h[:6] == b'\x7fELF\x02\x01' and h[18:20] == b'\x3e\x00'
-          PY
-          printf 'Archive SHA256 %s; schema SHA256 %s\n' "$ARCHIVE_SHA" "$SCHEMA_SHA"
-          printf 'ELF SHA256 %s; ELF bytes %s\n' "$actual_sha" "$actual_bytes"
-          if [[ "$PHASE" == prepare ]]; then
-            # Static ELF metadata inspection. Never invoke the binary or ldd.
-            LC_ALL=C readelf -lW "$lab/context/codex" > "$lab/elf-programs" 2>/dev/null
-            LC_ALL=C readelf -dW "$lab/context/codex" > "$lab/elf-dynamic" 2>/dev/null
-            python3 - "$lab" <<'PY'
-          import pathlib, re, sys
-          p = pathlib.Path(sys.argv[1])
-          programs = (p / 'elf-programs').read_text()
-          dynamic = (p / 'elf-dynamic').read_text()
-          interp = re.findall(r'\[Requesting program interpreter: ([^\]]+)\]', programs)
-          needed = re.findall(r'\(NEEDED\).*?\[([^\]]+)\]', dynamic)
-          assert not interp and not needed
-          print('ELF interpreter: absent; DT_NEEDED: 0')
-          PY
-            echo PREPARED_NO_EXECUTION
+          trap cleanup EXIT
+          mkdir "$LAB/source" "$LAB/context" 2>/dev/null
+          test "$(df -Pk "$LAB" | awk 'END {print $4}')" -ge 4194304
+          git_public() {
+            local limit=3
+            [[ "$1" == fetch ]] && limit=25
+            env -i PATH="$PATH" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+              GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false timeout "$limit"s git -C "$LAB/source" \
+              -c credential.helper= -c http.followRedirects=false -c core.hooksPath=/dev/null "$@" 2>/dev/null
+          }
+          git_public init --quiet --template= >/dev/null
+          git_public fetch --depth=1 --no-tags --no-recurse-submodules \
+            "https://github.com/$GITHUB_REPOSITORY.git" "$GITHUB_SHA" >/dev/null
+          test "$(git_public rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
+          printf '%s\n' .github/workflows/m5-p2-a.yml contract.json probe.mjs |
+            diff -q - <(git_public ls-tree -r --name-only FETCH_HEAD) >/dev/null 2>&1
+          for name in contract.json probe.mjs; do
+            [[ $(git_public ls-tree FETCH_HEAD -- "$name") == "100644 blob "* ]]
+            git_public show "FETCH_HEAD:$name" > "$LAB/context/$name"
+            chmod 0444 "$LAB/context/$name" 2>/dev/null
+          done
+          trap 'echo HOST_SCHEMA_VALIDATION_FAILURE' ERR
+          curl --proto '=https' --proto-redir '=https' --fail --silent \
+            --location --max-time 70 --max-filesize 753162 --output "$LAB/context/schema.json" \
+            'https://raw.githubusercontent.com/openai/codex/rust-v0.167.0/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json' \
+            >/dev/null 2>&1
+          test "$(wc -c < "$LAB/context/schema.json")" -eq 753162
+          printf '%s  %s\n' "$SCHEMA_SHA" "$LAB/context/schema.json" | sha256sum --check --status 2>/dev/null
+          echo PINNED_SCHEMA_VERIFIED
+          trap 'echo BLOCKED_SYNTHETIC_BUILD' ERR
+          engine=$(timeout 5s docker version --format '{{.Server.Version}}' 2>/dev/null) || engine=
+          if [[ "$engine" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            printf 'DOCKER_ENGINE_VERSION %s\n' "$engine"
           else
-            test "$actual_sha" = "$ELF_SHA"
-            test "$actual_bytes" -eq "$ELF_BYTES"
+            echo DOCKER_ENGINE_VERSION_UNKNOWN
           fi
-      - name: Build exact context from pinned image
-        if: inputs.phase == 'verify' || inputs.phase == 'probe'
-        run: |
-          trap 'echo BLOCKED_IMAGE' ERR
-          root=$(docker info --format '{{.DockerRootDir}}')
+          root=$(timeout 5s docker info --format '{{.DockerRootDir}}' 2>/dev/null)
           test "$(df -Pk "$root" | awk 'END {print $4}')" -ge 4194304
-          printf 'Runner image %s; kernel %s\n' "${ImageVersion:-unknown}" "$(uname -r)"
-          docker version --format 'Docker server {{.Server.Version}}'
-          zstd --version
-          curl --version | sed -n '1p'
-          docker pull --platform linux/amd64 "$BASE"
-          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$BASE")" = linux/amd64
-          install -m 0444 probe.mjs contract.json "$LAB/context/"
+          timeout 50s docker pull --platform linux/amd64 "$BASE" > "$LAB/image-pull" 2>&1
+          test "$(timeout 5s docker image inspect --format '{{.Os}}/{{.Architecture}}' "$BASE" 2>/dev/null)" = linux/amd64
           cat > "$LAB/context/Dockerfile" <<'DOCKERFILE'
           ARG BASE
           FROM ${BASE}
@@ -136,107 +105,294 @@ jobs:
           RUN ["/usr/local/bin/node","-e","const f=require('node:fs'); f.writeFileSync('/app/readonly-canary','synthetic'); f.chmodSync('/app/readonly-canary',0o666)"]
           USER 1000:1000
           ENTRYPOINT ["/usr/local/bin/node", "/app/probe.mjs"]
-          CMD []
+          CMD ["--synthetic-diagnostic"]
           DOCKERFILE
-          if [[ "$PHASE" == probe ]]; then
-            printf 'COPY --chmod=0555 codex /app/codex\n' >> "$LAB/context/Dockerfile"
-          else
-            test ! -e "$LAB/context/codex" && test ! -e "$LAB/codex.zst"
-          fi
-          docker build --pull=false --network none --platform linux/amd64 \
-            --build-arg BASE="$BASE" --tag p2a-local:approved "$LAB/context"
-      - name: Verify containment, run offline, verify teardown
-        if: inputs.phase == 'verify' || inputs.phase == 'probe'
-        run: |
-          set -E
-          trap 'echo BLOCKED_CONTAINMENT_OR_PROTOCOL' ERR
-          argv=()
-          if [[ "$PHASE" == verify ]]; then argv+=(--synthetic-verify); fi
-          cid=$(timeout 5s docker create --pull=never --network none --ipc none --init \
-            --read-only --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges \
-            --pids-limit 24 --memory 512m --memory-swap 512m --cpus 1 --restart no \
-            --log-driver none --no-healthcheck \
-            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777 \
-            --tmpfs /home/node:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=1000,gid=1000 \
-            --env HOME=/home/node p2a-local:approved "${argv[@]}")
-          trap 'timeout 5s docker rm -f "$cid" >/dev/null 2>&1 || echo BLOCKED_CLEANUP' EXIT
-          timeout 5s docker inspect "$cid" > "$LAB/pre.json"
-          python3 - "$LAB/pre.json" "$PHASE" <<'PY'
-          import json, sys
-          with open(sys.argv[1]) as f:
-              d = json.load(f)[0]
-          h, c = d['HostConfig'], d['Config']
-          assert d['State']['Status'] == 'created'
-          assert c['User'] == '1000:1000' and not c['Volumes']
-          assert not c['Tty'] and not c['OpenStdin']
-          assert c['Entrypoint'] == ['/usr/local/bin/node', '/app/probe.mjs']
-          if sys.argv[2] == 'verify':
-              assert c['Cmd'] == ['--synthetic-verify']
-          else:
-              assert not c['Cmd']
-          assert h['Init'] is True
-          assert h['NetworkMode'] == 'none' and h['IpcMode'] == 'none' and not h['PidMode']
-          assert h['ReadonlyRootfs'] and not h['Privileged'] and not h['CapAdd']
-          assert h['CapDrop'] == ['ALL']
-          assert h['SecurityOpt'] in (['no-new-privileges'], ['no-new-privileges=true'])
-          assert not any(h.get(k) for k in ('Binds', 'Mounts', 'Devices', 'DeviceRequests', 'PortBindings', 'VolumesFrom'))
-          assert not h['PublishAllPorts'] and h['LogConfig']['Type'] == 'none'
-          assert h['PidsLimit'] == 24 and h['Memory'] == h['MemorySwap'] == 536870912
-          assert h['NanoCpus'] == 1000000000 and h['RestartPolicy']['Name'] == 'no'
-          assert set(h['Tmpfs']) == {'/tmp', '/home/node'}
-          allowed_env = {'PATH', 'NODE_VERSION', 'YARN_VERSION', 'HOME'}
-          assert all(e.partition('=')[0] in allowed_env for e in c['Env'])
-          assert 'HOME=/home/node' in c['Env']
-          PY
-          if (ulimit -f 64; timeout --kill-after=0.25s 20s docker start --attach "$cid" \
-            > "$LAB/result.json" 2> "$LAB/stderr"); then
-            echo ATTACH_RETURNED
-          else
-            timeout 3s docker kill "$cid" >/dev/null 2>&1 || true
-            echo BLOCKED_WATCHDOG_OR_EXIT_EMERGENCY_CLEANUP
-            exit 1
-          fi
-          timeout 5s docker inspect "$cid" > "$LAB/post.json"
-          python3 - "$LAB/post.json" "$LAB/result.json" "$PHASE" <<'PY'
-          import json, pathlib, sys
+          timeout 50s docker build --pull=false --network none --platform linux/amd64 \
+            --build-arg BASE="$BASE" --tag p2a-local:diagnostic "$LAB/context" > "$LAB/image-build" 2>&1
+          echo SYNTHETIC_IMAGE_BUILT
+          unset PYTHONOPTIMIZE PYTHONPATH PYTHONHOME
+          trap - ERR
+          python3 - "$LAB" <<'PY'
           from datetime import datetime
-          with open(sys.argv[1]) as f:
-              s = json.load(f)[0]['State']
-          assert s['Status'] == 'exited' and not s['Running'] and s['Pid'] == 0
-          assert s['ExitCode'] == 0 and not s['OOMKilled'] and not s['Error']
-          parse = lambda v: datetime.fromisoformat(v.replace('Z', '+00:00'))
-          assert 0 <= (parse(s['FinishedAt']) - parse(s['StartedAt'])).total_seconds() <= 20
-          p = pathlib.Path(sys.argv[2])
-          assert p.stat().st_size <= 1024
-          r = json.loads(p.read_bytes())
-          if sys.argv[3] == 'verify':
-              assert set(r) == {'status', 'preflight', 'cases', 'allStopped'}
-              assert r['status'] == 'PASS_SYNTHETIC_PROFILE'
-              assert r['preflight'] is True and r['allStopped'] is True
-              assert type(r['cases']) is int and r['cases'] == 14
-              print('Verified synthetic cases:', r['cases'])
-          else:
-              assert set(r) == {'status', 'preflight', 'childReaped', 'runMs', 'shutdownMs'}
-              assert r['status'] == 'PASS_PROTOCOL_LINUX' and r['preflight'] is True and r['childReaped'] is True
-              assert type(r['runMs']) is int and 0 <= r['runMs'] <= 15000
-              assert type(r['shutdownMs']) is int and 0 <= r['shutdownMs'] <= 5000
-              print('Validated run/shutdown ms:', r['runMs'], r['shutdownMs'])
+          import json
+          import math
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+          import tempfile
+          import time
+
+          def parse_json(raw):
+              def unique(pairs):
+                  result = {}
+                  for key, value in pairs:
+                      if key in result:
+                          raise ValueError("duplicate key")
+                      result[key] = value
+                  return result
+              return json.loads(raw, object_pairs_hook=unique)
+
+          def clamped_ms(value):
+              return min(60000, max(0, math.ceil(value)))
+
+          def inspect_state(outcome):
+              status = {"state": "UNKNOWN", "pid": "UNKNOWN", "oom": None,
+                        "exitCode": None, "stateError": None, "containerElapsedMs": None}
+              code, raw, _ = outcome
+              if code != 0:
+                  return status
+              try:
+                  state = parse_json(raw)
+                  if not isinstance(state, dict):
+                      return status
+                  container_state = state.get("Status")
+                  if container_state in ("created", "running", "paused", "restarting", "removing", "exited", "dead"):
+                      status["state"] = container_state.upper()
+                  pid = state.get("Pid")
+                  if type(pid) is int and 0 <= pid <= 4194304:
+                      status["pid"] = "ZERO" if pid == 0 else "NONZERO"
+                  if type(state.get("OOMKilled")) is bool:
+                      status["oom"] = state["OOMKilled"]
+                  exit_code = state.get("ExitCode")
+                  if type(exit_code) is int and 0 <= exit_code <= 255:
+                      status["exitCode"] = exit_code
+                  error = state.get("Error")
+                  if isinstance(error, str):
+                      status["stateError"] = bool(error)
+                  if state.get("Running") is False and status["state"] in ("EXITED", "DEAD"):
+                      started, finished = (datetime.fromisoformat(state[k].replace("Z", "+00:00"))
+                                           for k in ("StartedAt", "FinishedAt"))
+                      if started.year > 1 and finished >= started:
+                          status["containerElapsedMs"] = clamped_ms((finished - started).total_seconds() * 1000)
+              except (KeyError, TypeError, AttributeError, ValueError, OverflowError):
+                  pass
+              return status
+
+          def inspect_workload(raw, contract):
+              if len(raw) > 1024:
+                  return False, None, False
+              lines = raw.splitlines()
+              if not lines:
+                  return False, None, True
+              if lines[0] != b'{"kind":"started"}':
+                  return False, None, False
+              if len(lines) == 1:
+                  return True, None, True
+              if len(lines) != 2:
+                  return True, None, False
+              try:
+                  event = parse_json(lines[1])
+              except (ValueError, UnicodeError):
+                  return True, None, False
+              if not isinstance(event, dict):
+                  return True, None, False
+              if set(event) == {"kind", "cases", "allStopped"} and event["kind"] == "complete":
+                  if (type(event["cases"]) is int and event["cases"] == contract["diagnostics"]["expectedCases"]
+                          and event["allStopped"] is True):
+                      return True, event, True
+              if set(event) in ({"kind", "code"}, {"kind", "code", "mount"}) and event["kind"] == "failure":
+                  if event["code"] not in contract["diagnostics"]["workloadCodes"]:
+                      return True, None, False
+                  if "mount" not in event and event["code"] != "UNEXPECTED_MOUNT":
+                      return True, event, True
+                  m = event.get("mount")
+                  if (event["code"] == "UNEXPECTED_MOUNT" and isinstance(m, dict)
+                          and set(m) == {"unexpectedCount", "initMount", "initPid"}
+                          and type(m["unexpectedCount"]) is int and 1 <= m["unexpectedCount"] <= 255
+                          and m["initMount"] in ("NONE", "EXACT_RO", "EXACT_RW", "AMBIGUOUS")
+                          and m["initPid"] in ("DOCKER_INIT", "OTHER", "UNKNOWN")):
+                      return True, event, True
+              return True, None, False
+
+          def validate_pre(raw, name):
+              d = parse_json(raw)
+              h, c = d["HostConfig"], d["Config"]
+              assert c["Labels"]["io.agentoffice.p2a.diagnostic"] == name and d["Name"] == "/" + name
+              assert d["State"]["Status"] == "created"
+              assert c["User"] == "1000:1000" and not c["Volumes"]
+              assert not c["Tty"] and not c["OpenStdin"]
+              assert c["Entrypoint"] == ["/usr/local/bin/node", "/app/probe.mjs"]
+              assert c["Cmd"] == ["--synthetic-diagnostic"] and h["Init"] is True
+              assert h["NetworkMode"] == "none" and h["IpcMode"] == "none" and not h["PidMode"]
+              assert h["ReadonlyRootfs"] and not h["Privileged"] and not h["CapAdd"]
+              assert h["CapDrop"] == ["ALL"]
+              assert h["SecurityOpt"] in (["no-new-privileges"], ["no-new-privileges=true"])
+              assert not any(h.get(k) for k in ("Binds", "Mounts", "Devices", "DeviceRequests", "PortBindings", "VolumesFrom"))
+              assert not h["PublishAllPorts"] and h["LogConfig"]["Type"] == "none"
+              assert h["PidsLimit"] == 24 and h["Memory"] == h["MemorySwap"] == 536870912
+              assert h["NanoCpus"] == 1000000000 and h["RestartPolicy"]["Name"] == "no"
+              assert set(h["Tmpfs"]) == {"/tmp", "/home/node"}
+              assert all(e.partition("=")[0] in {"PATH", "NODE_VERSION", "YARN_VERSION", "HOME"} for e in c["Env"])
+              assert "HOME=/home/node" in c["Env"]
+
+          def diagnose(run, name, contract, precheck):
+              codes = []
+              report = {"codes": codes, "passed": False, "watchdog": "NOT_STARTED", "attachElapsedMs": None,
+                        "attachExitCode": None, "emergency": "NOT_NEEDED", "removal": "NOT_ATTEMPTED",
+                        "absenceConfirmed": False, "selectorWitness": False, "teardownConfirmed": False,
+                        "startedMarker": False, "cases": None}
+              report.update(inspect_state((None, b"", False)))
+
+              def call(op, seconds):
+                  try:
+                      return run((op,), seconds)
+                  except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+                      return None, b"", False
+
+              def confirm_absence():
+                  rc, data, _ = call("list", 3)
+                  return rc == 0 and data.strip() == b""
+
+              rc, output, create_timeout = call("create", 5)
+              created = rc == 0 and re.fullmatch(rb"[a-f0-9]{64}", output.strip()) is not None
+              if not created:
+                  codes.append("DOCKER_CREATE_FAILURE")
+                  if confirm_absence():
+                      # A timed-out CLI call may still be in flight at the Docker daemon.
+                      report["absenceConfirmed"] = rc is not None and not create_timeout
+                      if not report["absenceConfirmed"]:
+                          codes.append("TEARDOWN_UNVERIFIED")
+                      return report
+                  owner_code, owner, _ = call("owned", 3)
+                  if owner_code != 0 or owner.strip() != name.encode("ascii"):
+                      codes.extend(["CLEANUP_FAILURE", "TEARDOWN_UNVERIFIED"])
+                      return report
+              else:
+                  rc, raw, _ = call("pre", 3)
+                  try:
+                      if rc != 0:
+                          raise ValueError("inspect")
+                      precheck(raw, name)
+                  except (AssertionError, ValueError, KeyError, TypeError, AttributeError, UnicodeError):
+                      codes.append("HOST_PREFLIGHT_FAILURE")
+
+              event = None
+              if created and not codes:
+                  start = time.monotonic()
+                  rc, raw, expired = call("attach", 20)
+                  report["attachElapsedMs"] = clamped_ms((time.monotonic() - start) * 1000)
+                  report["attachExitCode"] = rc if type(rc) is int and -64 <= rc <= 255 else None
+                  report["watchdog"] = "EXPIRED" if expired else ("CLEAR" if rc is not None else "UNKNOWN")
+                  if expired:
+                      codes.append("WATCHDOG_EXPIRED")
+                  started, event, valid = inspect_workload(raw, contract)
+                  report["startedMarker"] = started
+                  if not valid:
+                      codes.append("WORKLOAD_EVIDENCE_INVALID")
+                  if event and event["kind"] == "failure":
+                      codes.append(event["code"])
+                      if "mount" in event:
+                          report["mount"] = event["mount"]
+                  elif event:
+                      report["cases"] = event["cases"]
+
+              before = inspect_state(call("state", 3))
+              report.update(before)
+              if report["watchdog"] not in ("NOT_STARTED", "EXPIRED"):
+                  proves_started = report["startedMarker"] or (
+                      before["state"] == "EXITED" and before["containerElapsedMs"] is not None
+                      and before["stateError"] is False)
+                  if not proves_started or report["attachExitCode"] is None:
+                      codes.append("DOCKER_START_ATTACH_FAILURE")
+                  elif before["exitCode"] not in (None, 0):
+                      codes.append("WORKLOAD_NONZERO_EXIT")
+                  elif report["attachExitCode"] != 0:
+                      codes.append("DOCKER_START_ATTACH_FAILURE")
+                  elif event is None and "WORKLOAD_EVIDENCE_INVALID" not in codes:
+                      codes.append("WORKLOAD_EVIDENCE_INVALID")
+              if before["state"] not in ("CREATED", "EXITED", "DEAD") or before["pid"] != "ZERO":
+                  report["beforeEmergencyState"] = before["state"]
+                  report["beforeEmergencyPid"] = before["pid"]
+                  rc, _, _ = call("kill", 3)
+                  report["emergency"] = "REQUESTED" if rc == 0 else "FAILED"
+                  report.update(inspect_state(call("state", 3)))
+              rc, selected, _ = call("list", 3)
+              report["selectorWitness"] = rc == 0 and selected.strip() == name.encode("ascii")
+              rc, _, _ = call("rm", 5)
+              report["removal"] = "OK" if rc == 0 else "FAILED"
+              absent = confirm_absence()
+              report["absenceConfirmed"] = report["selectorWitness"] and absent
+              report["teardownConfirmed"] = (report["state"] in ("EXITED", "DEAD") and report["pid"] == "ZERO"
+                                               and report["containerElapsedMs"] is not None and report["absenceConfirmed"])
+              if report["removal"] != "OK" or not report["absenceConfirmed"] or report["emergency"] == "FAILED":
+                  codes.append("CLEANUP_FAILURE")
+              if not report["teardownConfirmed"] and "TEARDOWN_UNVERIFIED" not in codes:
+                  codes.append("TEARDOWN_UNVERIFIED")
+              report["passed"] = (not codes and report["watchdog"] == "CLEAR" and report["attachExitCode"] == 0
+                                  and report["exitCode"] == 0 and report["oom"] is False
+                                  and report["stateError"] is False and report["containerElapsedMs"] <= 20000
+                                  and report["cases"] == contract["diagnostics"]["expectedCases"])
+              if not report["passed"] and not codes:
+                  codes.append("SYNTHETIC_VERDICT_UNVERIFIED")
+              return report
+
+          def main():
+              import resource
+              lab = Path(sys.argv[1])
+              run_id = os.environ["GITHUB_RUN_ID"]
+              attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+              assert re.fullmatch(r"[1-9][0-9]{0,19}", run_id) and attempt == "1"
+              name = f"p2a-diagnostic-{run_id}-{attempt}"
+              contract = parse_json((lab / "context" / "contract.json").read_bytes())
+              assert contract["diagnostics"]["expectedCases"] == 14
+              cmds = {
+                  "create": [
+                      "create", "--name", name, "--label", f"io.agentoffice.p2a.diagnostic={name}",
+                      "--pull=never", "--network", "none", "--ipc", "none", "--init",
+                      "--read-only", "--user", "1000:1000", "--cap-drop", "ALL",
+                      "--security-opt", "no-new-privileges", "--pids-limit", "24",
+                      "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--restart", "no",
+                      "--log-driver", "none", "--no-healthcheck",
+                      "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777",
+                      "--tmpfs", "/home/node:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=1000,gid=1000",
+                      "--env", "HOME=/home/node", "p2a-local:diagnostic",
+                  ],
+                  "pre": ["inspect", "--type=container", "--format", "{{json .}}", name],
+                  "attach": ["start", "--attach", name],
+                  "state": ["inspect", "--type=container", "--format", "{{json .State}}", name],
+                  "owned": ["inspect", "--type=container", "--format", '{{index .Config.Labels "io.agentoffice.p2a.diagnostic"}}', name],
+                  "kill": ["kill", name],
+                  "rm": ["rm", "--force", name],
+                  "list": ["ps", "--all", "--filter", f"name=^/{name}$", "--format", "{{.Names}}"],
+              }
+
+              issued_id = None
+
+              def run(args, seconds):
+                  nonlocal issued_id
+                  op = args[0]
+                  command = cmds[op]
+                  if issued_id is not None and op in ("pre", "attach", "state", "kill", "rm"):
+                      command = [*command[:-1], issued_id]
+
+                  def set_output_limit():
+                      resource.setrlimit(resource.RLIMIT_FSIZE, (32768, 32768))
+
+                  with tempfile.TemporaryFile(dir=lab) as output:
+                      expired = False
+                      try:
+                          call = subprocess.run(["docker", *command], stdin=subprocess.DEVNULL, stdout=output,
+                                                stderr=subprocess.DEVNULL, check=False, timeout=seconds,
+                                                preexec_fn=set_output_limit)
+                          code = call.returncode
+                      except subprocess.TimeoutExpired:
+                          code, expired = None, True
+                      output.seek(0)
+                      raw = output.read(32768)
+                      if op == "create" and code == 0 and re.fullmatch(rb"[a-f0-9]{64}", raw.strip()):
+                          issued_id = raw.strip().decode("ascii")
+                      return code, raw, expired
+
+              report = diagnose(run, name, contract, validate_pre)
+              print(json.dumps(report, separators=(",", ":")))
+              return 0 if report["passed"] else 1
+
+          if __name__ == "__main__":
+              try:
+                  sys.exit(main())
+              except Exception:
+                  print('{"codes":["HOST_DIAGNOSTIC_FAILURE","TEARDOWN_UNVERIFIED"],"passed":false}')
+                  sys.exit(1)
           PY
-          timeout 5s docker rm "$cid" >/dev/null
-          remaining=$(timeout 5s docker ps -aq --no-trunc --filter "id=$cid")
-          test -z "$remaining"
-          trap - EXIT
-          if [[ "$PHASE" == verify ]]; then
-            echo PASS_SYNTHETIC_PROFILE
-          else
-            echo PASS_PROTOCOL_LINUX
-          fi
-      - name: Clean scoped temporary directory
-        if: always()
-        run: |
-          [[ -n "${LAB:-}" ]] || exit 0
-          parent=$(realpath -e "$RUNNER_TEMP")
-          [[ "$LAB" =~ /m5-p2-a\.[a-zA-Z0-9]{6}$ ]]
-          [[ -d "$LAB" && ! -L "$LAB" && "$(realpath -e "$LAB")" == "$parent/"* ]]
-          rm -rf -- "$LAB"
-          echo TEMP_CLEANUP_COMPLETE

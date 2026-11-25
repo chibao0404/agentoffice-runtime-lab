@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { accessSync, chmodSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { accessSync, chmodSync, mkdirSync, readFileSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { performance } from 'node:perf_hooks';
@@ -17,60 +17,112 @@ function need(condition, code = 'CONTRACT_VIOLATION') {
   if (!condition) throw new Error(code);
 }
 
-function errno(action, expected) {
-  try { action(); } catch (error) { need(error.code === expected, 'FILESYSTEM_UNVERIFIED'); return; }
-  throw new Error('FILESYSTEM_UNVERIFIED');
+class DiagnosticFailure extends Error {
+  constructor(code, mount) {
+    super(code);
+    this.mount = mount;
+  }
 }
 
-function preflightFiles() {
-  const entries = readFileSync('/proc/self/mountinfo', 'utf8').trim().split('\n')
-    .map((line) => line.split(' - ')[0].split(' '));
-  const mount = (name) => entries.find((fields) => fields[4] === name)?.[5]?.split(',') ?? [];
-  need(mount('/').includes('ro') && mount('/tmp').includes('rw') && mount('/home/node').includes('rw'));
-  // Docker-managed hosts, hostname and resolv.conf may be injected. Reject extra mounts outside kernel paths.
-  const named = new Set(['/', '/tmp', '/home/node', '/etc/hosts', '/etc/hostname', '/etc/resolv.conf']);
-  need(entries.every(([, , , , target]) => named.has(target) || /^\/(proc|sys|dev)(\/|$)/.test(target)));
-  const missing = ['/var/run/docker.sock', '/run/docker.sock', '/run/secrets', '/root/.codex', '/home/node/.codex',
-    '/home/node/.ssh', '/home/node/.config', '/home/node/.aws', '/github/workspace', '/workspace', '/mnt/c', profile];
-  // /root is itself inaccessible to UID 1000; inspect standard credential paths only under accessible mounts.
-  for (const path of missing.filter((path) => path !== '/root/.codex')) errno(() => accessSync(path), 'ENOENT');
-  mkdirSync(profile, { mode: 0o700 });
-  for (const name of ['home', 'codex', 'config', 'data', 'cache', 'state', 'tmp']) {
-    mkdirSync(profile + '/' + name, { mode: 0o700 });
+async function phase(code, check) {
+  try { return await check(); }
+  catch (error) {
+    if (error instanceof DiagnosticFailure) throw error;
+    throw new DiagnosticFailure(code);
   }
-  const canary = profile + '/tmp/canary';
-  writeFileSync(canary, 'synthetic', { flag: 'wx' });
-  need(readFileSync(canary, 'utf8') === 'synthetic');
-  chmodSync(canary, 0o400);
-  errno(() => writeFileSync(canary, 'wrong'), 'EACCES');
-  unlinkSync(canary);
-  // Image build creates a 0666 canary. EROFS, not DAC, must be the cause here.
-  errno(() => writeFileSync('/app/readonly-canary', 'wrong'), 'EROFS');
+}
+
+function errno(action, expected) {
+  try { action(); } catch (error) { need(error.code === expected); return; }
+  throw new Error('UNEXPECTED_ERRNO');
+}
+
+function mountEntries(raw) {
+  need(typeof raw === 'string' && Buffer.byteLength(raw) <= 131072);
+  return raw.trim().split('\n').map((line) => {
+    const separator = line.indexOf(' - ');
+    need(separator > 0);
+    const fields = line.slice(0, separator).split(' ');
+    need(fields.length >= 6);
+    return { target: fields[4], options: fields[5].split(',') };
+  });
+}
+
+export function classifyMounts(raw, initPid) {
+  const entries = mountEntries(raw);
+  const named = new Set(['/', '/tmp', '/home/node', '/etc/hosts', '/etc/hostname', '/etc/resolv.conf']);
+  const unexpected = entries.filter(({ target }) => !named.has(target) && !/^\/(proc|sys|dev)(\/|$)/.test(target));
+  const initEntries = unexpected.filter(({ target }) => target === '/sbin/docker-init' || target === '/usr/sbin/docker-init');
+  const initOptions = initEntries[0]?.options ?? [];
+  const initMount = initEntries.length === 0 ? 'NONE'
+    : initEntries.length > 1 || initOptions.includes('ro') === initOptions.includes('rw') ? 'AMBIGUOUS'
+      : initOptions.includes('ro') ? 'EXACT_RO' : 'EXACT_RW';
+  const mount = (name) => entries.find(({ target }) => target === name)?.options ?? [];
+  return {
+    unexpectedCount: Math.min(255, unexpected.length),
+    initMount,
+    initPid: initPid === 'docker-init' ? 'DOCKER_INIT' : initPid === undefined ? 'UNKNOWN' : 'OTHER',
+    expectedModes: mount('/').includes('ro') && mount('/tmp').includes('rw') && mount('/home/node').includes('rw'),
+  };
+}
+
+async function preflightFiles() {
+  let initPid;
+  try { initPid = readFileSync('/proc/1/comm', 'utf8').trim(); } catch { /* unknown */ }
+  const { expectedModes, ...mount } = await phase('MOUNT_EVIDENCE_UNAVAILABLE',
+    () => classifyMounts(readFileSync('/proc/self/mountinfo', 'utf8'), initPid));
+  if (mount.unexpectedCount > 0) throw new DiagnosticFailure('UNEXPECTED_MOUNT', mount);
+  await phase('FILESYSTEM_CANARY_FAILURE', () => need(expectedModes));
+  await phase('CREDENTIAL_BOUNDARY_FAILURE', () => {
+    const missing = ['/var/run/docker.sock', '/run/docker.sock', '/run/secrets', '/home/node/.codex',
+      '/home/node/.ssh', '/home/node/.config', '/home/node/.aws', '/github/workspace', '/workspace', '/mnt/c', profile];
+    for (const path of missing) errno(() => accessSync(path), 'ENOENT');
+  });
+  await phase('FILESYSTEM_CANARY_FAILURE', () => {
+    mkdirSync(profile, { mode: 0o700 });
+    for (const name of ['home', 'codex', 'config', 'data', 'cache', 'state', 'tmp']) {
+      mkdirSync(profile + '/' + name, { mode: 0o700 });
+    }
+    const canary = profile + '/tmp/canary';
+    writeFileSync(canary, 'synthetic', { flag: 'wx' });
+    need(readFileSync(canary, 'utf8') === 'synthetic');
+    chmodSync(canary, 0o400);
+    errno(() => writeFileSync(canary, 'wrong'), 'EACCES');
+    unlinkSync(canary);
+    // The image canary has mode 0666. EROFS distinguishes overlay restriction from DAC.
+    errno(() => writeFileSync('/app/readonly-canary', 'wrong'), 'EROFS');
+  });
 }
 
 async function preflight() {
-  need(process.platform === 'linux' && process.arch === 'x64' && process.getuid() === 1000 && process.getgid() === 1000);
-  const allowed = ['PATH', 'NODE_VERSION', 'YARN_VERSION', 'HOME', 'HOSTNAME', 'PWD'];
-  need(Object.keys(process.env).every((name) => allowed.includes(name)) && process.env.HOME === '/home/node');
-  const status = readFileSync('/proc/self/status', 'utf8');
-  need(/^CapEff:\s+0+$/m.test(status) && /^NoNewPrivs:\s+1$/m.test(status) && /^Seccomp:\s+2$/m.test(status));
-  need(Object.keys(networkInterfaces()).join() === 'lo');
-  need(readFileSync('/proc/net/route', 'utf8').trim().split('\n').length === 1);
-  preflightFiles();
-  await new Promise((resolve, reject) => {
-    const socket = createConnection({ host: '192.0.2.1', port: 9 });
-    socket.setTimeout(250);
-    socket.once('error', (error) => {
-      socket.destroy();
-      if (['ENETUNREACH', 'EHOSTUNREACH'].includes(error.code)) resolve();
-      else reject(new Error('NETWORK_UNVERIFIED'));
-    });
-    for (const event of ['timeout', 'connect']) {
-      socket.once(event, () => {
+  await phase('CONTAINER_PREFLIGHT_FAILURE', () => {
+    need(process.platform === 'linux' && process.arch === 'x64' && process.getuid() === 1000 && process.getgid() === 1000);
+    const status = readFileSync('/proc/self/status', 'utf8');
+    need(/^CapEff:\s+0+$/m.test(status) && /^NoNewPrivs:\s+1$/m.test(status) && /^Seccomp:\s+2$/m.test(status));
+  });
+  await phase('CREDENTIAL_BOUNDARY_FAILURE', () => {
+    const allowed = ['PATH', 'NODE_VERSION', 'YARN_VERSION', 'HOME', 'HOSTNAME', 'PWD'];
+    need(Object.keys(process.env).every((name) => allowed.includes(name)) && process.env.HOME === '/home/node');
+  });
+  await preflightFiles();
+  await phase('NETWORK_ISOLATION_FAILURE', async () => {
+    need(Object.keys(networkInterfaces()).join() === 'lo');
+    need(readFileSync('/proc/net/route', 'utf8').trim().split('\n').length === 1);
+    await new Promise((resolve, reject) => {
+      const socket = createConnection({ host: '192.0.2.1', port: 9 });
+      socket.setTimeout(250);
+      socket.once('error', (error) => {
         socket.destroy();
-        reject(new Error('NETWORK_UNVERIFIED'));
+        if (['ENETUNREACH', 'EHOSTUNREACH'].includes(error.code)) resolve();
+        else reject(new Error('NETWORK_UNVERIFIED'));
       });
-    }
+      for (const event of ['timeout', 'connect']) {
+        socket.once(event, () => {
+          socket.destroy();
+          reject(new Error('NETWORK_UNVERIFIED'));
+        });
+      }
+    });
   });
 }
 
@@ -297,36 +349,45 @@ export async function syntheticSuite({ requireLinux = false } = {}) {
     const bounds = { runMs: ['ignore', 'descendant', 'timeout'].includes(name) ? 300 : 1000,
       graceMs: 150, termMs: 350, shutdownMs: 1500 };
     const result = await supervise(process.execPath, ['-e', childSource, name], { env: {} }, bounds);
-    need(result.reason === expected && result.childReaped && result.teardownConfirmed, 'SYNTHETIC_CASE_FAILED_' + name);
+    if (!result.childReaped || !result.teardownConfirmed) throw new DiagnosticFailure('TEARDOWN_UNVERIFIED');
+    need(result.reason === expected, 'SYNTHETIC_CASE_FAILED_' + name);
     if (name === 'ignore' || name === 'descendant') need(result.action === 'KILL', 'SYNTHETIC_FORCE_KILL_MISSING');
     results.push({ name, reason: result.reason, action: result.action, teardownConfirmed: result.teardownConfirmed });
   }
   return results;
 }
 
+export function diagnosticFailureRecord(error) {
+  const code = error instanceof DiagnosticFailure && contract.diagnostics.workloadCodes.includes(error.message)
+    ? error.message : 'CONTAINER_PREFLIGHT_FAILURE';
+  return error instanceof DiagnosticFailure && code === 'UNEXPECTED_MOUNT'
+    ? { kind: 'failure', code, mount: error.mount }
+    : { kind: 'failure', code };
+}
+
+function emit(event) {
+  writeSync(1, JSON.stringify(event) + '\n');
+}
+
 async function main() {
-  need(JSON.stringify(contract.methods) === '["initialize","initialized","config/read"]');
-  need(JSON.stringify(contract.bounds) === '{"runMs":15000,"graceMs":3000,"termMs":4000,"shutdownMs":5000}');
+  emit({ kind: 'started' });
+  await phase('CONTAINER_PREFLIGHT_FAILURE', () => {
+    need(process.argv.length === 3 && process.argv[2] === '--synthetic-diagnostic');
+    need(JSON.stringify(contract.methods) === '["initialize","initialized","config/read"]');
+    need(JSON.stringify(contract.bounds) === '{"runMs":15000,"graceMs":3000,"termMs":4000,"shutdownMs":5000}');
+  });
   await preflight();
-  loadPinnedSchema(readFileSync(new URL('schema.json', source)));
-  if (process.argv.length === 3 && process.argv[2] === '--synthetic-verify') {
-    const cases = await syntheticSuite({ requireLinux: true });
-    console.log(JSON.stringify({ status: 'PASS_SYNTHETIC_PROFILE', preflight: true, cases: cases.length,
-      allStopped: cases.every((item) => item.teardownConfirmed) }));
-    return;
+  await phase('SCHEMA_VALIDATION_FAILURE', () => loadPinnedSchema(readFileSync(new URL('schema.json', source))));
+  const cases = await phase('SYNTHETIC_CASE_FAILURE', () => syntheticSuite({ requireLinux: true }));
+  if (cases.length !== contract.diagnostics.expectedCases || !cases.every((item) => item.teardownConfirmed)) {
+    throw new DiagnosticFailure('TEARDOWN_UNVERIFIED');
   }
-  need(process.argv.length === 2);
-  const env = {
-    PATH: '/usr/bin:/bin', HOME: profile + '/home', CODEX_HOME: profile + '/codex',
-    XDG_CONFIG_HOME: profile + '/config', XDG_DATA_HOME: profile + '/data',
-    XDG_CACHE_HOME: profile + '/cache', XDG_STATE_HOME: profile + '/state', TMPDIR: profile + '/tmp',
-  };
-  const r = await supervise('/app/codex', ['app-server', '--listen', 'stdio://'], { cwd: profile + '/tmp', env }, contract.bounds);
-  need(r.reason === 'OK' && r.teardownConfirmed);
-  console.log(JSON.stringify({ status: 'PASS_PROTOCOL_LINUX', preflight: true, childReaped: r.childReaped,
-    runMs: r.runMs, shutdownMs: r.shutdownMs }));
+  emit({ kind: 'complete', cases: cases.length, allStopped: true });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch(() => { console.log('BLOCKED_PROTOCOL_OR_ISOLATION'); process.exitCode = 1; });
+  main().catch((error) => {
+    emit(diagnosticFailureRecord(error));
+    process.exitCode = 1;
+  });
 }

@@ -34,5 +34,19 @@
       "on-request",
       "never"
     ]
+  },
+  "diagnostics": {
+    "expectedCases": 14,
+    "workloadCodes": [
+      "CONTAINER_PREFLIGHT_FAILURE",
+      "UNEXPECTED_MOUNT",
+      "MOUNT_EVIDENCE_UNAVAILABLE",
+      "FILESYSTEM_CANARY_FAILURE",
+      "NETWORK_ISOLATION_FAILURE",
+      "CREDENTIAL_BOUNDARY_FAILURE",
+      "SCHEMA_VALIDATION_FAILURE",
+      "SYNTHETIC_CASE_FAILURE",
+      "TEARDOWN_UNVERIFIED"
+    ]
   }
 }
