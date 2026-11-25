@@ -1,0 +1,11 @@
+{
+  "methods": [
+    "initialize",
+    "initialized",
+    "config/read"
+  ],
+  "runMs": 15000,
+  "shutdownMs": 5000,
+  "lineBytes": 65536,
+  "totalBytes": 262144
+}

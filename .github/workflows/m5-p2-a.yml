@@ -1,0 +1,211 @@
+name: M5-P2-A Remote Lab
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        type: choice
+        options: [prepare, probe]
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: m5-p2-a-remote-lab
+  cancel-in-progress: false
+jobs:
+  lab:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
+    env:
+      PHASE: ${{ inputs.phase }}
+      APPROVED_REPO: ${{ vars.P2A_REPO }}
+      PREPARE_COMMIT: ${{ vars.P2A_PREPARE_COMMIT }}
+      PROBE_COMMIT: ${{ vars.P2A_PROBE_COMMIT }}
+      ELF_SHA: ${{ vars.P2A_ELF_SHA256 }}
+      ELF_BYTES: ${{ vars.P2A_ELF_BYTES }}
+      ARCHIVE_SHA: 3911007fc94091b5eea2a10512b2b4fc52b673bc0cb3026e4cbff0cd518dd060
+      SCHEMA_SHA: 021462a9bacd117f4cd40c256a4888619d059cec6a65b795198d521ba660e554
+      BASE: docker.io/library/node@sha256:d45d78e7929b46875bbd4e29bea672d5bc48186c6c3588306521c815e78352d6
+    steps:
+      - name: Enforce authorization pins
+        run: |
+          trap 'echo BLOCKED_AUTHORIZATION' ERR
+          test "$GITHUB_REPOSITORY" = "$APPROVED_REPO"
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$RUNNER_OS/$RUNNER_ARCH" = Linux/X64
+          case "$PHASE" in
+            prepare) test "$GITHUB_SHA" = "$PREPARE_COMMIT" ;;
+            probe)
+              test "$GITHUB_SHA" = "$PROBE_COMMIT"
+              [[ "$ELF_SHA" =~ ^[a-f0-9]{64}$ ]]
+              [[ "$ELF_BYTES" =~ ^[1-9][0-9]{0,8}$ ]]
+              (( ELF_BYTES < 805306368 )) ;;
+            *) exit 1 ;;
+          esac
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+      - name: Stage and verify official inputs on networked host
+        run: |
+          trap 'echo BLOCKED_STAGING' ERR
+          umask 077
+          for utility in curl zstd sha256sum python3 timeout git docker readelf; do
+            command -v "$utility" >/dev/null
+          done
+          printf '%s\n' .github/workflows/m5-p2-a.yml contract.json probe.mjs |
+            diff -q - <(git ls-tree -r --name-only HEAD) >/dev/null
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(df -Pk "$RUNNER_TEMP" | awk 'END {print $4}')" -ge 4194304
+          lab=$(mktemp -d "$RUNNER_TEMP/m5-p2-a.XXXXXX")
+          printf 'LAB=%s\n' "$lab" >> "$GITHUB_ENV"
+          mkdir "$lab/context"
+          fetch() {
+            curl --proto '=https' --proto-redir '=https' --fail --silent --show-error \
+              --location --max-time 80 --max-filesize "$2" --output "$3" "$1" 2>/dev/null
+            test "$(wc -c < "$3")" -eq "$2"
+          }
+          fetch 'https://github.com/openai/codex/releases/download/rust-v0.167.0/codex-x86_64-unknown-linux-musl.zst' \
+            87330415 "$lab/codex.zst"
+          fetch 'https://raw.githubusercontent.com/openai/codex/rust-v0.167.0/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json' \
+            753162 "$lab/context/schema.json"
+          printf '%s  %s\n' "$ARCHIVE_SHA" "$lab/codex.zst" | sha256sum --check --status
+          printf '%s  %s\n' "$SCHEMA_SHA" "$lab/context/schema.json" | sha256sum --check --status
+          (ulimit -f 786432; timeout 20s zstd -q -d -c "$lab/codex.zst" > "$lab/context/codex")
+          read -r actual_sha _ < <(sha256sum "$lab/context/codex")
+          actual_bytes=$(wc -c < "$lab/context/codex")
+          python3 - "$lab/context/codex" <<'PY'
+          import sys
+          with open(sys.argv[1], 'rb') as f:
+              h = f.read(20)
+          assert h[:6] == b'\x7fELF\x02\x01' and h[18:20] == b'\x3e\x00'
+          PY
+          printf 'Archive SHA256 %s; schema SHA256 %s\n' "$ARCHIVE_SHA" "$SCHEMA_SHA"
+          printf 'ELF SHA256 %s; ELF bytes %s\n' "$actual_sha" "$actual_bytes"
+          if [[ "$PHASE" == prepare ]]; then
+            # Static ELF metadata inspection. Never invoke the binary or ldd.
+            LC_ALL=C readelf -lW "$lab/context/codex" > "$lab/elf-programs" 2>/dev/null
+            LC_ALL=C readelf -dW "$lab/context/codex" > "$lab/elf-dynamic" 2>/dev/null
+            python3 - "$lab" <<'PY'
+          import pathlib, re, sys
+          p = pathlib.Path(sys.argv[1])
+          programs = (p / 'elf-programs').read_text()
+          dynamic = (p / 'elf-dynamic').read_text()
+          interp = re.findall(r'\[Requesting program interpreter: ([^\]]+)\]', programs)
+          needed = re.findall(r'\(NEEDED\).*?\[([^\]]+)\]', dynamic)
+          assert not interp and not needed
+          print('ELF interpreter: absent; DT_NEEDED: 0')
+          PY
+            echo PREPARED_NO_EXECUTION
+          else
+            test "$actual_sha" = "$ELF_SHA"
+            test "$actual_bytes" -eq "$ELF_BYTES"
+          fi
+      - name: Build exact context from pinned image
+        if: inputs.phase == 'probe'
+        run: |
+          trap 'echo BLOCKED_IMAGE' ERR
+          root=$(docker info --format '{{.DockerRootDir}}')
+          test "$(df -Pk "$root" | awk 'END {print $4}')" -ge 4194304
+          printf 'Runner image %s; kernel %s\n' "${ImageVersion:-unknown}" "$(uname -r)"
+          docker version --format 'Docker server {{.Server.Version}}'
+          zstd --version
+          curl --version | sed -n '1p'
+          docker pull --platform linux/amd64 "$BASE"
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$BASE")" = linux/amd64
+          install -m 0444 probe.mjs contract.json "$LAB/context/"
+          cat > "$LAB/context/Dockerfile" <<'DOCKERFILE'
+          ARG BASE
+          FROM ${BASE}
+          WORKDIR /app
+          COPY --chmod=0555 codex /app/codex
+          COPY --chmod=0444 schema.json probe.mjs contract.json /app/
+          USER 1000:1000
+          ENTRYPOINT ["/usr/local/bin/node", "/app/probe.mjs"]
+          CMD []
+          DOCKERFILE
+          docker build --pull=false --network none --platform linux/amd64 \
+            --build-arg BASE="$BASE" --tag p2a-local:approved "$LAB/context"
+      - name: Verify containment, run offline, verify teardown
+        if: inputs.phase == 'probe'
+        run: |
+          set -E
+          trap 'echo BLOCKED_CONTAINMENT_OR_PROTOCOL' ERR
+          cid=$(timeout 5s docker create --pull=never --network none --ipc none \
+            --read-only --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges \
+            --pids-limit 24 --memory 512m --memory-swap 512m --cpus 1 --restart no \
+            --log-driver none --no-healthcheck \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777 \
+            --tmpfs /home/node:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=1000,gid=1000 \
+            --env HOME=/home/node p2a-local:approved)
+          trap 'timeout 5s docker rm -f "$cid" >/dev/null 2>&1 || echo BLOCKED_CLEANUP' EXIT
+          timeout 5s docker inspect "$cid" > "$LAB/pre.json"
+          python3 - "$LAB/pre.json" <<'PY'
+          import json, sys
+          with open(sys.argv[1]) as f:
+              d = json.load(f)[0]
+          h, c = d['HostConfig'], d['Config']
+          assert d['State']['Status'] == 'created'
+          assert c['User'] == '1000:1000' and not c['Volumes']
+          assert not c['Tty'] and not c['OpenStdin']
+          assert c['Entrypoint'] == ['/usr/local/bin/node', '/app/probe.mjs'] and not c['Cmd']
+          assert h['NetworkMode'] == 'none' and h['IpcMode'] == 'none' and not h['PidMode']
+          assert h['ReadonlyRootfs'] and not h['Privileged'] and not h['CapAdd']
+          assert h['CapDrop'] == ['ALL']
+          assert h['SecurityOpt'] in (['no-new-privileges'], ['no-new-privileges=true'])
+          assert not any(h.get(k) for k in ('Binds', 'Mounts', 'Devices', 'DeviceRequests', 'PortBindings', 'VolumesFrom'))
+          assert not h['PublishAllPorts'] and h['LogConfig']['Type'] == 'none'
+          assert h['PidsLimit'] == 24 and h['Memory'] == h['MemorySwap'] == 536870912
+          assert h['NanoCpus'] == 1000000000 and h['RestartPolicy']['Name'] == 'no'
+          assert set(h['Tmpfs']) == {'/tmp', '/home/node'}
+          allowed_env = {'PATH', 'NODE_VERSION', 'YARN_VERSION', 'HOME'}
+          assert all(e.partition('=')[0] in allowed_env for e in c['Env'])
+          assert 'HOME=/home/node' in c['Env']
+          PY
+          if (ulimit -f 64; timeout --kill-after=1s 20s docker start --attach "$cid" \
+            > "$LAB/result.json" 2> "$LAB/stderr"); then
+            echo ATTACH_RETURNED
+          else
+            timeout 3s docker kill "$cid" >/dev/null 2>&1 || true
+            echo BLOCKED_WATCHDOG_OR_EXIT
+            exit 1
+          fi
+          timeout 5s docker inspect "$cid" > "$LAB/post.json"
+          python3 - "$LAB/post.json" "$LAB/result.json" <<'PY'
+          import json, pathlib, sys
+          from datetime import datetime
+          with open(sys.argv[1]) as f:
+              s = json.load(f)[0]['State']
+          assert s['Status'] == 'exited' and not s['Running'] and s['Pid'] == 0
+          assert s['ExitCode'] == 0 and not s['OOMKilled'] and not s['Error']
+          parse = lambda v: datetime.fromisoformat(v.replace('Z', '+00:00'))
+          assert 0 <= (parse(s['FinishedAt']) - parse(s['StartedAt'])).total_seconds() <= 20
+          p = pathlib.Path(sys.argv[2])
+          assert p.stat().st_size <= 1024
+          r = json.loads(p.read_bytes())
+          assert set(r) == {'status', 'preflight', 'childReaped', 'runMs', 'shutdownMs'}
+          assert r['status'] == 'PASS_PROTOCOL_LINUX' and r['preflight'] is True and r['childReaped'] is True
+          assert type(r['runMs']) is int and 0 <= r['runMs'] <= 15000
+          assert type(r['shutdownMs']) is int and 0 <= r['shutdownMs'] <= 5000
+          print('Validated run/shutdown ms:', r['runMs'], r['shutdownMs'])
+          PY
+          timeout 5s docker rm "$cid" >/dev/null
+          remaining=$(timeout 5s docker ps -aq --no-trunc --filter "id=$cid")
+          test -z "$remaining"
+          trap - EXIT
+          echo PASS_PROTOCOL_LINUX
+      - name: Clean scoped temporary directory
+        if: always()
+        run: |
+          [[ -n "${LAB:-}" ]] || exit 0
+          parent=$(realpath -e "$RUNNER_TEMP")
+          [[ "$LAB" =~ /m5-p2-a\.[a-zA-Z0-9]{6}$ ]]
+          [[ -d "$LAB" && ! -L "$LAB" && "$(realpath -e "$LAB")" == "$parent/"* ]]
+          rm -rf -- "$LAB"
+          echo TEMP_CLEANUP_COMPLETE
