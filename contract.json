@@ -4,8 +4,35 @@
     "initialized",
     "config/read"
   ],
-  "runMs": 15000,
-  "shutdownMs": 5000,
+  "bounds": {
+    "runMs": 15000,
+    "graceMs": 3000,
+    "termMs": 4000,
+    "shutdownMs": 5000
+  },
+  "schemaSha256": "021462a9bacd117f4cd40c256a4888619d059cec6a65b795198d521ba660e554",
   "lineBytes": 65536,
-  "totalBytes": 262144
+  "totalBytes": 262144,
+  "projected": {
+    "initializeRequired": [
+      "codexHome",
+      "platformFamily",
+      "platformOs",
+      "userAgent"
+    ],
+    "configRequired": [
+      "config",
+      "origins"
+    ],
+    "sandboxModes": [
+      "read-only",
+      "workspace-write",
+      "danger-full-access"
+    ],
+    "approvalPolicies": [
+      "untrusted",
+      "on-request",
+      "never"
+    ]
+  }
 }
