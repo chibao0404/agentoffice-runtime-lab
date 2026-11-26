@@ -60,24 +60,178 @@ jobs:
           trap cleanup EXIT
           mkdir "$LAB/source" "$LAB/context" 2>/dev/null
           test "$(df -Pk "$LAB" | awk 'END {print $4}')" -ge 4194304
-          git_public() {
-            local limit=3
-            [[ "$1" == fetch ]] && limit=25
-            env -i PATH="$PATH" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-              GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false timeout "$limit"s git -C "$LAB/source" \
-              -c credential.helper= -c http.followRedirects=false -c core.hooksPath=/dev/null "$@" 2>/dev/null
+          if env -i PATH="$PATH" timeout --kill-after=1s 37s python3 -I - \
+              "$LAB/context" "$APPROVED_REPO" "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$DIAGNOSTIC_COMMIT" \
+              "$GITHUB_REF" "$GITHUB_ACTOR" "$GITHUB_TRIGGERING_ACTOR" <<'REST_PY'
+          import base64
+          import hashlib
+          import json
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+          import time
+
+          REPOSITORY = "chibao0404/agentoffice-runtime-lab"
+          PATHS = {
+              ".github": ("tree", "040000"),
+              ".github/workflows": ("tree", "040000"),
+              ".github/workflows/m5-p2-a.yml": ("blob", "100644"),
+              "contract.json": ("blob", "100644"),
+              "probe.mjs": ("blob", "100644"),
           }
-          git_public init --quiet --template= >/dev/null
-          git_public fetch --depth=1 --no-tags --no-recurse-submodules \
-            "https://github.com/$GITHUB_REPOSITORY.git" "$GITHUB_SHA" >/dev/null
-          test "$(git_public rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
-          printf '%s\n' .github/workflows/m5-p2-a.yml contract.json probe.mjs |
-            diff -q - <(git_public ls-tree -r --name-only FETCH_HEAD) >/dev/null 2>&1
-          for name in contract.json probe.mjs; do
-            [[ $(git_public ls-tree FETCH_HEAD -- "$name") == "100644 blob "* ]]
-            git_public show "FETCH_HEAD:$name" > "$LAB/context/$name"
-            chmod 0444 "$LAB/context/$name" 2>/dev/null
-          done
+          BLOBS = {
+              "contract.json": ("CONTRACT", 1078, "4dd5f1b47b4340557e22f3aa6d2b3e128725013cf4d080cb34a5620c3f6bea9b"),
+              "probe.mjs": ("PROBE", 18298, "5bb6df87dd981e16568edee12a0b3165a00f9ad41b228d777b3cfddb71abc091"),
+          }
+          RESPONSE_LIMIT = 65_536
+          REQUEST_SECONDS = 12
+          STAGING_SECONDS = 36
+
+          class StageError(Exception):
+              def __init__(self, code, phase):
+                  self.code = code
+                  self.phase = phase
+                  super().__init__(f"{code} {phase}")
+
+          def sha40(value):
+              return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) is not None
+
+          def parse_response(raw, phase, invalid_code):
+              def unique_object(pairs):
+                  obj = {}
+                  for key, value in pairs:
+                      if key in obj:
+                          raise ValueError
+                      obj[key] = value
+                  return obj
+
+              try:
+                  parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+              except (ValueError, RecursionError):
+                  raise StageError(invalid_code, phase) from None
+              if not isinstance(parsed, dict):
+                  raise StageError(invalid_code, phase)
+              return parsed
+
+          def fetch_response(url, phase, deadline, run):
+              remaining = min(REQUEST_SECONDS, deadline - time.monotonic())
+              if remaining <= 0:
+                  raise StageError("SOURCE_FETCH_TIMEOUT", phase)
+              args = [
+                  "curl", "--disable", "--proto", "=https", "--noproxy", "*", "--silent",
+                  "--max-time", str(remaining), "--max-filesize", str(RESPONSE_LIMIT),
+                  "--header", "Accept: application/vnd.github+json",
+                  "--write-out", "\n%{http_code}", "--", url,
+              ]
+              try:
+                  reply = run(args, stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, timeout=remaining, check=False)
+              except subprocess.TimeoutExpired:
+                  raise StageError("SOURCE_FETCH_TIMEOUT", phase) from None
+              except OSError:
+                  raise StageError("SOURCE_FETCH_FAILED", phase) from None
+              if reply.returncode == 28 or time.monotonic() >= deadline:
+                  raise StageError("SOURCE_FETCH_TIMEOUT", phase)
+              if reply.returncode != 0 or len(reply.stdout) > RESPONSE_LIMIT + 4:
+                  raise StageError("SOURCE_FETCH_FAILED", phase)
+              raw, sep, status = reply.stdout.rpartition(b"\n")
+              if not sep or status != b"200" or len(raw) > RESPONSE_LIMIT:
+                  raise StageError("SOURCE_FETCH_FAILED", phase)
+              return raw
+
+          def verify_tree(raw):
+              tree = parse_response(raw, "TREE", "SOURCE_TREE_MISMATCH")
+              rows = tree.get("tree")
+              if tree.get("truncated") is not False or not sha40(tree.get("sha")) \
+                      or not isinstance(rows, list) or len(rows) != len(PATHS):
+                  raise StageError("SOURCE_TREE_MISMATCH", "TREE")
+              pins = {}
+              for entry in rows:
+                  if not isinstance(entry, dict):
+                      raise StageError("SOURCE_TREE_MISMATCH", "TREE")
+                  path = entry.get("path")
+                  kind_mode = (entry.get("type"), entry.get("mode"))
+                  if not isinstance(path, str) or path not in PATHS or path in pins \
+                          or PATHS[path] != kind_mode or not sha40(entry.get("sha")):
+                      raise StageError("SOURCE_TREE_MISMATCH", "TREE")
+                  if path in BLOBS and (type(entry.get("size")) is not int or entry["size"] != BLOBS[path][1]):
+                      raise StageError("SOURCE_TREE_MISMATCH", "TREE")
+                  pins[path] = entry["sha"]
+              return pins
+
+          def verify_blob(raw, pin, phase, exact_size, digest):
+              blob = parse_response(raw, phase, "SOURCE_BLOB_MISMATCH")
+              content = blob.get("content")
+              if blob.get("sha") != pin or blob.get("encoding") != "base64" \
+                      or type(blob.get("size")) is not int or blob["size"] != exact_size \
+                      or not isinstance(content, str):
+                  raise StageError("SOURCE_BLOB_MISMATCH", phase)
+              try:
+                  encoded = content.replace("\r\n", "\n").replace("\n", "").encode("ascii")
+                  if len(encoded) != 4 * ((exact_size + 2) // 3):
+                      raise ValueError
+                  data = base64.b64decode(encoded, validate=True)
+              except ValueError:
+                  raise StageError("SOURCE_BLOB_MISMATCH", phase) from None
+              git_blob = f"blob {len(data)}\0".encode() + data
+              if len(data) != exact_size or base64.b64encode(data) != encoded \
+                      or hashlib.sha1(git_blob).hexdigest() != pin or hashlib.sha256(data).hexdigest() != digest:
+                  raise StageError("SOURCE_BLOB_MISMATCH", phase)
+              return data
+
+          def stage_sources(dest, repo, commit, run=subprocess.run, emit=print):
+              if repo != REPOSITORY or not sha40(commit):
+                  raise StageError("SOURCE_FETCH_FAILED", "AUTHORITY")
+              deadline = time.monotonic() + STAGING_SECONDS
+              prefix = f"https://api.github.com/repos/{repo}/git/"
+              raw_tree = fetch_response(prefix + f"trees/{commit}?recursive=1", "TREE", deadline, run)
+              emit("SOURCE_TREE_FETCHED")
+              pins = verify_tree(raw_tree)
+              emit("SOURCE_TREE_VERIFIED")
+              verified = {}
+              for path, (phase, size, digest) in BLOBS.items():
+                  pin = pins[path]
+                  raw = fetch_response(prefix + f"blobs/{pin}", phase, deadline, run)
+                  verified[path] = verify_blob(raw, pin, phase, size, digest)
+                  emit(f"SOURCE_{phase}_VERIFIED")
+              if time.monotonic() >= deadline:
+                  raise StageError("SOURCE_FETCH_TIMEOUT", "STAGING")
+              for path, data in verified.items():
+                  target = dest / path
+                  with target.open("xb") as file:
+                      file.write(data)
+                  target.chmod(0o444)
+              emit("SOURCE_STAGING_COMPLETE")
+
+          def main(args):
+              dest, approved, repo, commit, pin, ref, actor, triggering = args
+              if approved != REPOSITORY or repo != REPOSITORY or commit != pin or ref != "refs/heads/main" \
+                      or actor != "chibao0404" or triggering != actor:
+                  raise StageError("SOURCE_FETCH_FAILED", "AUTHORITY")
+              stage_sources(Path(dest), repo, commit)
+
+          if __name__ == "__main__":
+              try:
+                  main(sys.argv[1:])
+              except StageError as failure:
+                  print(failure, flush=True)
+                  sys.exit(2)
+              except Exception:
+                  print("SOURCE_FETCH_FAILED STAGING", flush=True)
+                  sys.exit(2)
+          REST_PY
+          then
+            :
+          else
+            status=$?
+            case "$status" in
+              124|137) echo "SOURCE_FETCH_TIMEOUT STAGING" ;;
+              2) ;;
+              *) echo "SOURCE_FETCH_FAILED STAGING" ;;
+            esac
+            exit 1
+          fi
           trap 'echo HOST_SCHEMA_VALIDATION_FAILURE' ERR
           curl --proto '=https' --proto-redir '=https' --fail --silent \
             --location --max-time 70 --max-filesize 753162 --output "$LAB/context/schema.json" \
